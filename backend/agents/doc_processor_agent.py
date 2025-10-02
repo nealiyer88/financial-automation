@@ -1,6 +1,11 @@
 import os
 import pdfplumber
-import fitz  # PyMuPDF
+try:
+    import fitz  # PyMuPDF
+    FITZ_AVAILABLE = True
+except ImportError:
+    FITZ_AVAILABLE = False
+    print("Warning: PyMuPDF (fitz) not available. Some PDF processing features will be limited.")
 from typing import List, Dict, Any
 from pdf2image import convert_from_path
 import pytesseract
@@ -95,6 +100,10 @@ def extract_tables_with_pdfplumber(file_path: str) -> List[List[List[str]]]:
 
 
 def extract_tables_with_pymupdf(file_path: str) -> List[List[List[str]]]:
+    if not FITZ_AVAILABLE:
+        print("PyMuPDF not available, skipping PyMuPDF extraction")
+        return []
+    
     doc = fitz.open(file_path)
     all_tables = []
 
