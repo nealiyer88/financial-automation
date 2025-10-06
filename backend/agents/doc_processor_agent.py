@@ -1,241 +1,244 @@
 import os
-import pdfplumber
-try:
-    import fitz  # PyMuPDF
-    FITZ_AVAILABLE = True
-except ImportError:
-    FITZ_AVAILABLE = False
-    print("Warning: PyMuPDF (fitz) not available. Some PDF processing features will be limited.")
-from typing import List, Dict, Any
-from pdf2image import convert_from_path
-import pytesseract
-from pytesseract import Output
-import shutil
+import pandas as pd
+import json
 import logging
-import re
+from typing import Tuple, Dict, Any
+from io import StringIO
+import pdfplumber
+
+logger = logging.getLogger(__name__)
 
 
 class DocProcessorAgent:
+    """
+    Modular document processor that prioritizes Excel/CSV/TXT/JSON ingestion
+    with minimal PDF fallback using pdfplumber.
+    """
+    
     def __init__(self):
-        if shutil.which("tesseract") is None:
-            logging.warning("Tesseract OCR executable not found in PATH. OCR extraction will fail unless Tesseract is installed and available.")
-
-    def process(self, file_path: str) -> Dict[str, Any]:
+        """Initialize the document processor."""
+        self.supported_extensions = {'.csv', '.xlsx', '.xls', '.txt', '.json', '.pdf'}
+    
+    def process_file(self, file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """
-        Extract tables from PDF using pdfplumber, fallback to PyMuPDF if needed.
-
+        Main entry point for processing files.
+        
         Args:
-            file_path (str): Path to uploaded file
-
+            file_path (str): Path to the file to process
+            
         Returns:
-            dict: {
-                "html": fallback stub string,
-                "json": {
-                    "tables": [...],
-                    "blocks": [],
-                    "metadata": {...}
-                }
-            }
+            Tuple[pd.DataFrame, Dict[str, Any]]: DataFrame and metadata dict
+            
+        Raises:
+            ValueError: If file type is unsupported
         """
-        logger = logging.getLogger(__name__)
-        extraction_status = None
-        tables = extract_tables_with_pdfplumber(file_path)
-        if tables and not contains_garbage_text(tables):
-            extraction_status = "pdfplumber"
-        else:
-            if not tables:
-                logger.warning("Fallback to PyMuPDF: pdfplumber found no tables.")
-            else:
-                logger.warning("Fallback to PyMuPDF: pdfplumber tables unusable (garbage detected).")
-            tables = extract_tables_with_pymupdf(file_path)
-            if tables and not contains_garbage_text(tables):
-                extraction_status = "fitz"
-            else:
-                if not tables:
-                    logger.warning("Fallback to OCR: fitz found no tables.")
-                else:
-                    logger.warning("Fallback to OCR: fitz tables unusable (garbage detected).")
-                tables = extract_tables_with_ocr(file_path)
-                if tables:
-                    extraction_status = "ocr"
-                else:
-                    extraction_status = "FAILED_ALL_METHODS"
-        logger.debug(f"Extracted {len(tables)} tables")
-        logger.debug(f"Source file: {file_path}")
-
-        return {
-            "html": "<html><body><p>Unstructured disabled due to crash</p></body></html>",
-            "json": {
-                "tables": tables,
-                "blocks": [],
-                "metadata": {
-                    "table_count": len(tables),
-                    "block_count": 0,
-                    "source_file": os.path.basename(file_path),
-                    "extraction_status": extraction_status
-                }
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        file_ext = os.path.splitext(file_path)[1].lower()
+        
+        if file_ext not in self.supported_extensions:
+            raise ValueError(f"Unsupported file type: {file_ext}")
+        
+        try:
+            if file_ext == '.csv':
+                return load_csv(file_path)
+            elif file_ext in ['.xlsx', '.xls']:
+                return load_excel(file_path)
+            elif file_ext == '.json':
+                return load_json(file_path)
+            elif file_ext == '.txt':
+                return load_txt(file_path)
+            elif file_ext == '.pdf':
+                return load_pdf(file_path)
+        except Exception as e:
+            logger.error(f"Error processing {file_path}: {e}")
+            return pd.DataFrame(), {
+                "error": str(e),
+                "file_type": file_ext,
+                "status": "failed"
             }
+
+
+def load_csv(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Load and process CSV file."""
+    try:
+        df = pd.read_csv(file_path)
+        df = normalize_headers(df)
+        
+        metadata = {
+            "file_type": "csv",
+            "rows": len(df),
+            "columns": len(df.columns),
+            "status": "success"
         }
+        
+        return df, metadata
+    except Exception as e:
+        logger.error(f"CSV loading failed: {e}")
+        return pd.DataFrame(), {"error": str(e), "file_type": "csv", "status": "failed"}
 
 
+def load_excel(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Load and process Excel file."""
+    try:
+        # Read the first sheet by default
+        df = pd.read_excel(file_path)
+        df = normalize_headers(df)
+        
+        metadata = {
+            "file_type": "excel",
+            "rows": len(df),
+            "columns": len(df.columns),
+            "status": "success"
+        }
+        
+        return df, metadata
+    except Exception as e:
+        logger.error(f"Excel loading failed: {e}")
+        return pd.DataFrame(), {"error": str(e), "file_type": "excel", "status": "failed"}
 
-def extract_tables_with_pdfplumber(file_path: str) -> List[List[List[str]]]:
-    all_tables = []
 
+def load_json(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Load and process JSON file."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Convert to DataFrame if it's a list of dicts
+        if isinstance(data, list) and all(isinstance(item, dict) for item in data):
+            df = pd.DataFrame(data)
+        else:
+            # For other JSON structures, create a single-row DataFrame
+            df = pd.DataFrame([data])
+        
+        df = normalize_headers(df)
+        
+        metadata = {
+            "file_type": "json",
+            "rows": len(df),
+            "columns": len(df.columns),
+            "status": "success"
+        }
+        
+        return df, metadata
+    except Exception as e:
+        logger.error(f"JSON loading failed: {e}")
+        return pd.DataFrame(), {"error": str(e), "file_type": "json", "status": "failed"}
+
+
+def load_txt(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Load and process TXT file."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Try to parse as CSV if it looks tabular
+        lines = content.strip().split('\n')
+        if len(lines) > 1 and ',' in lines[0]:
+            try:
+                df = pd.read_csv(StringIO(content))
+                df = normalize_headers(df)
+            except:
+                # If CSV parsing fails, treat as raw text
+                df = pd.DataFrame({'text': [content[:1000]]})  # First 1000 chars
+        else:
+            # Treat as raw text
+            df = pd.DataFrame({'text': [content[:1000]]})
+        
+        metadata = {
+            "file_type": "txt",
+            "rows": len(df),
+            "columns": len(df.columns),
+            "status": "success"
+        }
+        
+        return df, metadata
+    except Exception as e:
+        logger.error(f"TXT loading failed: {e}")
+        return pd.DataFrame(), {"error": str(e), "file_type": "txt", "status": "failed"}
+
+
+def load_pdf(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Minimal PDF processing using pdfplumber."""
     try:
         with pdfplumber.open(file_path) as pdf:
-            for page_number, page in enumerate(pdf.pages):
-                tables = page.extract_tables()
-                for table in tables:
-                    cleaned_table = [
-                        [cell.strip() if cell else "" for cell in row]
-                        for row in table
-                    ]
-                    all_tables.append(cleaned_table)
+            text_content = ""
+            for page in pdf.pages:
+                text_content += page.extract_text() or ""
+        
+        # Try to parse as CSV if it looks tabular
+        if ',' in text_content and '\n' in text_content:
+            try:
+                df = pd.read_csv(StringIO(text_content))
+                df = normalize_headers(df)
+                
+                metadata = {
+                    "file_type": "pdf",
+                    "rows": len(df),
+                    "columns": len(df.columns),
+                    "status": "success",
+                    "extraction_method": "pdfplumber_csv"
+                }
+                return df, metadata
+            except:
+                pass
+        
+        # Fallback to raw text
+        df = pd.DataFrame({'raw_text': [text_content[:1000]]})
+        
+        metadata = {
+            "file_type": "pdf",
+            "rows": 1,
+            "columns": 1,
+            "status": "success",
+            "extraction_method": "pdfplumber_text"
+        }
+        
+        return df, metadata
     except Exception as e:
-        print(f"[ERROR] pdfplumber failed: {e}")
-        return []
-
-    return all_tables
+        logger.error(f"PDF loading failed: {e}")
+        return pd.DataFrame(), {"error": str(e), "file_type": "pdf", "status": "failed"}
 
 
-def extract_tables_with_pymupdf(file_path: str) -> List[List[List[str]]]:
-    if not FITZ_AVAILABLE:
-        print("PyMuPDF not available, skipping PyMuPDF extraction")
-        return []
+def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize column headers: strip whitespace, lowercase, replace spaces with underscores."""
+    if df.empty:
+        return df
     
-    doc = fitz.open(file_path)
-    all_tables = []
-
-    for page_index, page in enumerate(doc):
-        words = page.get_text("words")  # returns list of (x0, y0, x1, y1, word, block_no, line_no, word_no)
-        words.sort(key=lambda w: (round(w[1], 1), w[0]))  # sort by y, then x
-
-        rows = []
-        current_y = None
-        current_row = []
-
-        for w in words:
-            x0, y0, x1, y1, text, *_ = w
-            y_key = round(y0, 1)
-
-            if current_y is None:
-                current_y = y_key
-
-            if abs(y_key - current_y) > 1.5:  # new row threshold
-                rows.append(current_row)
-                current_row = [text]
-                current_y = y_key
-            else:
-                current_row.append(text)
-
-        if current_row:
-            rows.append(current_row)
-
-        all_tables.append(rows)
-
-    return all_tables
-
-
-def contains_garbage_text(tables: List[List[List[str]]]) -> bool:
-    """
-    Returns True if the tables are likely to be garbled nonsense.
-    - Triggers on encoding artifacts (e.g., (cid:, \uFFFD)
-    - Triggers if more than 50% of chars in a cell are non-alphanumeric (excluding numbers)
-    - Triggers if a row has fewer than 2 word-like cells (at least 2 consecutive letters)
-    Numeric values (e.g., '1234', '8,223') are not considered word-like, but do not count as garbage unless the row is mostly symbols or short codes.
-    """
-    logger = logging.getLogger(__name__)
-    non_alpha_threshold = 0.5  # If more than 50% of chars are non-alphanumeric
-    min_wordlike_cells = 2     # Require at least 2 word-like cells per row
-    for table in tables:
-        for row in table:
-            wordlike_cells = 0
-            for cell in row:
-                # Check for encoding artifacts
-                if "(cid:" in cell or "\uFFFD" in cell:
-                    logger.warning(f"Detected encoding artifact in cell: {cell}")
-                    return True
-                # Check for mostly non-alphanumeric (excluding numbers)
-                if cell:
-                    non_alpha = sum(1 for c in cell if not c.isalnum())
-                    if len(cell) > 0 and (non_alpha / len(cell)) > non_alpha_threshold:
-                        logger.warning(f"Cell has high non-alphanumeric ratio: {cell}")
-                        continue
-                    # Check for word-like content (at least 2 consecutive letters)
-                    if re.search(r"[A-Za-z]{2,}", cell):
-                        wordlike_cells += 1
-            if wordlike_cells < min_wordlike_cells:
-                logger.warning(f"Row has too few word-like cells: {row}")
-                return True
-    return False
-
-def extract_tables_with_ocr(file_path: str) -> List[List[List[str]]]:
-    """
-    Fallback: Extract tables from scanned/image-only PDFs using OCR.
-
-    Returns:
-        List of tables, each a list of rows, each row a list of strings.
-    """
-    logger = logging.getLogger(__name__)
-    logger.info("Running OCR fallback...")
-    try:
-        images = convert_from_path(file_path, dpi=300)
-        all_tables = []
-        for page_num, image in enumerate(images):
-            ocr_data = pytesseract.image_to_data(image, output_type=Output.DICT)
-            # Step 1: Group words by Y (row)
-            row_buckets = {}
-            for i in range(len(ocr_data["text"])):
-                word = ocr_data["text"][i].strip()
-                if not word:
-                    continue
-                y = ocr_data["top"][i]
-                y_rounded = round(y / 10.0) * 10  # cluster y's by row band
-                if y_rounded not in row_buckets:
-                    row_buckets[y_rounded] = []
-                row_buckets[y_rounded].append({
-                    "word": word,
-                    "x": ocr_data["left"][i]
-                })
-            # Step 2: For each row, sort/group by X (column)
-            sorted_y = sorted(row_buckets.keys())
-            page_table = []
-            # Heuristic: estimate number of columns from the row with most words
-            max_row = max(row_buckets.values(), key=lambda r: len(r)) if row_buckets else []
-            n_cols = min(8, max(2, len(max_row)))  # Clamp to [2,8] columns for safety
-            # For each row, cluster by X
-            for y in sorted_y:
-                row = row_buckets[y]
-                # Sort words left-to-right
-                row_sorted = sorted(row, key=lambda w: w["x"])
-                # Get X positions
-                x_positions = [w["x"] for w in row_sorted]
-                # If enough words, estimate column boundaries
-                if len(x_positions) >= n_cols:
-                    # Compute column boundaries by splitting X range into n_cols buckets
-                    min_x, max_x = min(x_positions), max(x_positions)
-                    col_width = (max_x - min_x) / n_cols if n_cols > 1 else 1
-                    col_bounds = [min_x + i * col_width for i in range(n_cols + 1)]
-                else:
-                    # Fallback: treat each word as a column
-                    col_bounds = [w["x"] for w in row_sorted] + [row_sorted[-1]["x"] + 100] if row_sorted else []
-                # Assign words to columns
-                columns = [[] for _ in range(n_cols)]
-                for w in row_sorted:
-                    col_idx = 0
-                    for i in range(n_cols):
-                        if w["x"] >= col_bounds[i] and w["x"] < col_bounds[i+1]:
-                            col_idx = i
-                            break
-                    columns[col_idx].append(w["word"])
-                # Join words in each column
-                clean_row = [" ".join(col).strip() for col in columns if col]
-                if any(cell for cell in clean_row):
-                    page_table.append(clean_row)
-            if page_table:
-                all_tables.append(page_table)
-        return all_tables
-    except Exception as e:
-        logger.error(f"OCR extraction failed: {e}")
-        return []
+    # Create normalized column names
+    normalized_columns = []
+    for col in df.columns:
+        if isinstance(col, str):
+            # Strip whitespace, lowercase, replace spaces and special chars with underscores
+            normalized = col.strip().lower().replace(' ', '_').replace('-', '_')
+            # Remove multiple underscores and non-alphanumeric chars except underscores
+            normalized = '_'.join(filter(None, normalized.split('_')))
+            normalized = ''.join(c if c.isalnum() or c == '_' else '' for c in normalized)
+            # Ensure it doesn't start with a number
+            if normalized and normalized[0].isdigit():
+                normalized = f"col_{normalized}"
+            # Ensure it's not empty
+            if not normalized:
+                normalized = f"col_{len(normalized_columns)}"
+        else:
+            normalized = f"col_{len(normalized_columns)}"
+        
+        normalized_columns.append(normalized)
+    
+    # Handle duplicate column names
+    final_columns = []
+    seen = set()
+    for col in normalized_columns:
+        if col in seen:
+            counter = 1
+            while f"{col}_{counter}" in seen:
+                counter += 1
+            final_columns.append(f"{col}_{counter}")
+            seen.add(f"{col}_{counter}")
+        else:
+            final_columns.append(col)
+            seen.add(col)
+    
+    df.columns = final_columns
+    return df
