@@ -18,235 +18,162 @@ class DocProcessorAgent:
         self.supported_extensions = {'.csv', '.xlsx', '.xls', '.txt', '.json', '.pdf'}
     
     def process_file(self, file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-        """
-        Main entry point for file processing.
-        
-        Args:
-            file_path (str): Path to the file to process
-            
-        Returns:
-            Tuple[pd.DataFrame, Dict[str, Any]]: DataFrame and metadata JSON
-            
-        Raises:
-            ValueError: If file type is not supported
-        """
+        """Main entry point for file processing."""
         file_path = Path(file_path)
         
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
         
         file_ext = file_path.suffix.lower()
-        
         if file_ext not in self.supported_extensions:
             raise ValueError(f"Unsupported file type: {file_ext}. Supported: {self.supported_extensions}")
         
         try:
             if file_ext == '.csv':
-                return load_csv(str(file_path))
+                return self._load_csv(str(file_path))
             elif file_ext in ['.xlsx', '.xls']:
-                return load_excel(str(file_path))
+                return self._load_excel(str(file_path))
             elif file_ext == '.json':
-                return load_json(str(file_path))
+                return self._load_json(str(file_path))
             elif file_ext == '.txt':
-                return load_txt(str(file_path))
+                return self._load_txt(str(file_path))
             elif file_ext == '.pdf':
-                return load_pdf(str(file_path))
+                return self._load_pdf(str(file_path))
         except Exception as e:
             self.logger.error(f"Error processing {file_path}: {e}")
-            return pd.DataFrame(), {
-                "error": str(e),
-                "file_type": file_ext,
-                "status": "failed"
+            return pd.DataFrame(), self._build_meta("failed", file_ext, error=str(e))
+
+    def process(self, file_path: str) -> Dict[str, Any]:
+        """Legacy method for backward compatibility."""
+        df, metadata = self.process_file(file_path)
+        
+        tables = [df.values.tolist()] if not df.empty else []
+        return {
+            "html": "<html><body><p>Data processed successfully</p></body></html>",
+            "json": {
+                "tables": tables,
+                "blocks": [],
+                "metadata": {
+                    "table_count": len(tables),
+                    "block_count": 0,
+                    "source_file": os.path.basename(file_path),
+                    "extraction_status": metadata.get("status", "unknown"),
+                    "rows": metadata.get("rows", 0),
+                    "columns": metadata.get("columns", 0)
+                }
             }
-
-
-def load_csv(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Load CSV file and return DataFrame with normalized headers."""
-    try:
-        df = pd.read_csv(file_path)
-        df = normalize_headers(df)
-        
-        metadata = {
-            "file_type": "csv",
-            "rows": len(df),
-            "columns": len(df.columns),
-            "status": "success"
         }
+    
+    def _try_load(self, loader_func, file_path: str, file_type: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """Helper to try loading file and return standardized format."""
+        try:
+            df = loader_func(file_path)
+            df = self._normalize_headers(df)
+            return df, self._build_meta("success", file_type, rows=len(df), columns=len(df.columns))
+        except Exception as e:
+            return pd.DataFrame(), self._build_meta("failed", file_type, error=str(e))
+    
+    def _build_meta(self, status: str, file_type: str, **kwargs) -> Dict[str, Any]:
+        """Helper to build standardized metadata."""
+        meta = {"file_type": file_type, "status": status}
+        meta.update(kwargs)
+        return meta
+    
+    def _normalize_headers(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Normalize column headers: strip whitespace, lowercase, replace spaces with underscores."""
+        if df.empty:
+            return df
         
-        return df, metadata
-    except Exception as e:
-        return pd.DataFrame(), {"error": str(e), "file_type": "csv", "status": "failed"}
-
-
-def load_excel(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Load Excel file and return DataFrame with normalized headers."""
-    try:
-        df = pd.read_excel(file_path)
-        df = normalize_headers(df)
+        new_columns = []
+        for col in df.columns:
+            if col is None:
+                new_columns.append('unnamed_column')
+            else:
+                normalized = str(col).strip().lower()
+                normalized = ''.join(c if c.isalnum() else '_' for c in normalized)
+                normalized = '_'.join(normalized.split())
+                new_columns.append(normalized)
         
-        metadata = {
-            "file_type": "excel",
-            "rows": len(df),
-            "columns": len(df.columns),
-            "status": "success"
-        }
-        
-        return df, metadata
-    except Exception as e:
-        return pd.DataFrame(), {"error": str(e), "file_type": "excel", "status": "failed"}
-
-
-def load_json(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Load JSON file and convert to DataFrame."""
-    try:
+        df.columns = new_columns
+        return df
+    
+    def _load_csv(self, file_path: str) -> pd.DataFrame:
+        """Load CSV file."""
+        return pd.read_csv(file_path)
+    
+    def _load_excel(self, file_path: str) -> pd.DataFrame:
+        """Load Excel file."""
+        return pd.read_excel(file_path)
+    
+    def _load_json(self, file_path: str) -> pd.DataFrame:
+        """Load JSON file and convert to DataFrame."""
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
-        # Handle different JSON structures
         if isinstance(data, list):
-            df = pd.DataFrame(data)
+            return pd.DataFrame(data)
         elif isinstance(data, dict):
-            # Try to find the main data array
-            if 'data' in data:
-                df = pd.DataFrame(data['data'])
-            else:
-                df = pd.DataFrame([data])
+            return pd.DataFrame(data['data'] if 'data' in data else [data])
         else:
-            df = pd.DataFrame()
-        
-        df = normalize_headers(df)
-        
-        metadata = {
-            "file_type": "json",
-            "rows": len(df),
-            "columns": len(df.columns),
-            "status": "success"
-        }
-        
-        return df, metadata
-    except Exception as e:
-        return pd.DataFrame(), {"error": str(e), "file_type": "json", "status": "failed"}
-
-
-def load_txt(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Load TXT file and attempt to parse as CSV."""
-    try:
+            return pd.DataFrame()
+    
+    def _load_txt(self, file_path: str) -> pd.DataFrame:
+        """Load TXT file and attempt to parse as CSV."""
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # Try to parse as CSV
         try:
-            df = pd.read_csv(StringIO(content))
-            df = normalize_headers(df)
-            metadata = {
-                "file_type": "txt_csv",
-                "rows": len(df),
-                "columns": len(df.columns),
-                "status": "success"
-            }
+            return pd.read_csv(StringIO(content))
         except:
-            # If not CSV, return as single column
             lines = content.strip().split('\n')
-            df = pd.DataFrame({'text': lines})
-            metadata = {
-                "file_type": "txt",
-                "rows": len(df),
-                "columns": 1,
-                "status": "success"
-            }
-        
-        return df, metadata
-    except Exception as e:
-        return pd.DataFrame(), {"error": str(e), "file_type": "txt", "status": "failed"}
-
-
-def load_pdf(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Minimal PDF processing using pdfplumber as fallback."""
-    try:
+            return pd.DataFrame({'text': lines})
+    
+    def _load_pdf(self, file_path: str) -> pd.DataFrame:
+        """Minimal PDF processing using pdfplumber as fallback."""
         with pdfplumber.open(file_path) as pdf:
             text_content = ""
             for page in pdf.pages:
                 text_content += page.extract_text() or ""
         
-        # Try to parse extracted text as CSV if it looks tabular
+        # Try to parse as CSV if tabular
         if ',' in text_content and '\n' in text_content:
             try:
-                df = pd.read_csv(StringIO(text_content))
-                df = normalize_headers(df)
-                metadata = {
-                    "file_type": "pdf_csv",
-                    "rows": len(df),
-                    "columns": len(df.columns),
-                    "status": "success"
-                }
-                return df, metadata
+                return pd.read_csv(StringIO(text_content))
             except:
                 pass
         
         # Fallback: return raw text (first 1000 chars)
         raw_text = text_content[:1000] if text_content else ""
-        df = pd.DataFrame({'raw_text': [raw_text]})
-        
-        metadata = {
-            "file_type": "pdf",
-            "rows": 1,
-            "columns": 1,
-            "raw_text_length": len(text_content),
-            "status": "success"
-        }
-        
-        return df, metadata
-    except Exception as e:
-        return pd.DataFrame(), {"error": str(e), "file_type": "pdf", "status": "failed"}
+        return pd.DataFrame({'raw_text': [raw_text]})
 
+
+# Legacy function exports for backward compatibility
+def load_csv(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Legacy function for backward compatibility."""
+    agent = DocProcessorAgent()
+    return agent._try_load(agent._load_csv, file_path, "csv")
+
+def load_excel(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Legacy function for backward compatibility."""
+    agent = DocProcessorAgent()
+    return agent._try_load(agent._load_excel, file_path, "excel")
+
+def load_json(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Legacy function for backward compatibility."""
+    agent = DocProcessorAgent()
+    return agent._try_load(agent._load_json, file_path, "json")
+
+def load_txt(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Legacy function for backward compatibility."""
+    agent = DocProcessorAgent()
+    return agent._try_load(agent._load_txt, file_path, "txt")
+
+def load_pdf(file_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Legacy function for backward compatibility."""
+    agent = DocProcessorAgent()
+    return agent._try_load(agent._load_pdf, file_path, "pdf")
 
 def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize column headers: strip whitespace, lowercase, replace spaces with underscores."""
-    if df.empty:
-        return df
-    
-    # Create normalized column names
-    new_columns = []
-    for col in df.columns:
-        if col is None:
-            new_columns.append('unnamed_column')
-        else:
-            # Strip whitespace, lowercase, replace spaces and special chars with underscores
-            normalized = str(col).strip().lower()
-            normalized = ''.join(c if c.isalnum() else '_' for c in normalized)
-            normalized = '_'.join(normalized.split())  # Remove multiple underscores
-            new_columns.append(normalized)
-    
-    df.columns = new_columns
-    return df
-
-
-# Legacy compatibility method
-def process(self, file_path: str) -> Dict[str, Any]:
-    """
-    Legacy method for backward compatibility.
-    Converts new format to old format.
-    """
-    df, metadata = self.process_file(file_path)
-    
-    # Convert DataFrame to old format
-    if df.empty:
-        tables = []
-    else:
-        tables = [df.values.tolist()]
-    
-    return {
-        "html": "<html><body><p>Data processed successfully</p></body></html>",
-        "json": {
-            "tables": tables,
-            "blocks": [],
-            "metadata": {
-                "table_count": len(tables),
-                "block_count": 0,
-                "source_file": os.path.basename(file_path),
-                "extraction_status": metadata.get("status", "unknown"),
-                "rows": metadata.get("rows", 0),
-                "columns": metadata.get("columns", 0)
-            }
-        }
-    }
+    """Legacy function for backward compatibility."""
+    agent = DocProcessorAgent()
+    return agent._normalize_headers(df)
